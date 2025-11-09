@@ -4,11 +4,13 @@ Testes automatizados para Fase 3 - TCP Simplificado.
 import sys
 import os
 import time
+import random
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fase3.tcp_socket import SimpleTCPSocket
+from utils.packet import TCPSegment
 
 
 def test_connection_establishment():
@@ -128,6 +130,76 @@ def test_flow_control():
     time.sleep(0.5)
 
 
+def test_retransmission():
+    """Teste 4: Retransmissão com perda de 20% dos segmentos."""
+    print("\n=== Teste 4: Retransmissão ===")
+    
+    random.seed(42)
+    loss_rate = 0.2
+    segment_counters = {'sent': 0, 'dropped': 0}
+    total_bytes = 64 * 1024  # 64 KB
+    
+    server = SimpleTCPSocket(8400)
+    server.listen()
+    
+    received = bytearray()
+    
+    def server_accept():
+        conn = server.accept()
+        deadline = time.time() + 20
+        while len(received) < total_bytes and time.time() < deadline:
+            chunk = conn.recv(4096)
+            if chunk:
+                received.extend(chunk)
+            else:
+                time.sleep(0.05)
+        conn.close()
+    
+    accept_thread = threading.Thread(target=server_accept)
+    accept_thread.start()
+    
+    time.sleep(0.1)
+    
+    client = SimpleTCPSocket(9400)
+    client.connect(('localhost', 8400))
+    
+    def lossy_interceptor(data, addr, send_func):
+        parsed = TCPSegment.parse_segment(data)
+        if parsed and parsed['data']:
+            segment_counters['sent'] += 1
+            if random.random() < loss_rate:
+                segment_counters['dropped'] += 1
+                return len(data)
+        return send_func(data, addr)
+    
+    client.set_send_interceptor(lossy_interceptor)
+    
+    payload = b'r' * total_bytes
+    
+    try:
+        start = time.time()
+        client.send(payload)
+        
+        accept_thread.join(timeout=25)
+        elapsed = time.time() - start
+        
+        assert len(received) == total_bytes, f"Dados recebidos: {len(received)} bytes, esperado {total_bytes}"
+        
+        stats = client.get_stats()
+        assert stats['retransmissions'] > 0, "Nenhuma retransmissão registrada"
+        
+        loss_percent = (segment_counters['dropped'] / segment_counters['sent'] * 100) if segment_counters['sent'] else 0.0
+        print(f"✓ Teste passou: Dados entregues com perda simulada de {loss_percent:.1f}%")
+        print(f"  Retransmissões registradas: {stats['retransmissions']}")
+        print(f"  Tempo total de transferência: {elapsed:.2f}s")
+    finally:
+        client.set_send_interceptor(None)
+        client.close()
+        server.close()
+        accept_thread.join(timeout=1)
+        time.sleep(0.5)
+
+
 def test_connection_close():
     """Teste 5: Encerramento de conexão."""
     print("\n=== Teste 5: Encerramento de Conexão ===")
@@ -213,6 +285,7 @@ if __name__ == '__main__':
         test_connection_establishment()
         test_data_transfer()
         test_flow_control()
+        test_retransmission()
         test_connection_close()
         test_performance()
         

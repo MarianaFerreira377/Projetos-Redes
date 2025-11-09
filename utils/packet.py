@@ -4,6 +4,9 @@ Suporta diferentes formatos de pacote para as fases RDT.
 """
 import struct
 import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Packet:
@@ -41,20 +44,57 @@ class RDT20Packet(Packet):
         checksum = Packet.calculate_checksum(data)
         # Empacota cabeçalho
         header = struct.pack(RDT20Packet.FORMAT, packet_type, checksum)
-        return header + data
+        packet = header + data
+        
+        # Log detalhado
+        tipo_nome = {0: "DATA", 1: "ACK", 2: "NAK"}.get(packet_type, f"UNKNOWN({packet_type})")
+        logger.debug(f"[PACKET CREATE] Tipo: {tipo_nome} ({packet_type}), "
+                    f"Formato: {RDT20Packet.FORMAT}, "
+                    f"Checksum: {checksum.hex()}, "
+                    f"Dados: {data[:50]}{'...' if len(data) > 50 else ''} ({len(data)} bytes), "
+                    f"Pacote completo: {len(packet)} bytes")
+        
+        return packet
     
     @staticmethod
     def parse_packet(packet):
         """Parseia um pacote rdt2.0."""
         if len(packet) < 5:
+            logger.warning(f"[PACKET PARSE] Pacote muito pequeno: {len(packet)} bytes (mínimo: 5)")
             return None, None, None
         
         header_size = struct.calcsize(RDT20Packet.FORMAT)
         packet_type, checksum = struct.unpack(RDT20Packet.FORMAT, packet[:header_size])
         data = packet[header_size:]
         
+        # Log do primeiro byte (tipo)
+        primeiro_byte = packet[0] if len(packet) > 0 else None
+        tipo_nome = {0: "DATA", 1: "ACK", 2: "NAK"}.get(packet_type, f"UNKNOWN({packet_type})")
+        
+        logger.debug(f"[PACKET PARSE] Primeiro byte: 0x{primeiro_byte:02x} ({primeiro_byte}), "
+                    f"Tipo: {tipo_nome} ({packet_type}), "
+                    f"Formato: {RDT20Packet.FORMAT}, "
+                    f"Header size: {header_size} bytes")
+        
         # Verifica checksum
         is_valid = Packet.verify_checksum(data, checksum)
+        
+        # Log detalhado da verificação
+        checksum_recebido_hex = checksum.hex()
+        checksum_calculado = Packet.calculate_checksum(data)
+        checksum_calculado_hex = checksum_calculado.hex()
+        
+        if is_valid:
+            logger.debug(f"[PACKET PARSE] ✓ Checksum VÁLIDO - "
+                        f"Recebido: {checksum_recebido_hex}, "
+                        f"Calculado: {checksum_calculado_hex}, "
+                        f"Dados: {data[:50]}{'...' if len(data) > 50 else ''} ({len(data)} bytes)")
+        else:
+            logger.warning(f"[PACKET PARSE] ✗ Checksum INVÁLIDO (CORRUPÇÃO DETECTADA) - "
+                          f"Recebido: {checksum_recebido_hex}, "
+                          f"Calculado: {checksum_calculado_hex}, "
+                          f"Dados: {data[:50]}{'...' if len(data) > 50 else ''} ({len(data)} bytes), "
+                          f"Pacote completo: {packet[:20].hex()}{'...' if len(packet) > 20 else ''}")
         
         return packet_type, data, is_valid
 

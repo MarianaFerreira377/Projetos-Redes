@@ -89,6 +89,7 @@ class SimpleTCPSocket:
         
         # Rastreamento de RTT
         self.send_times = {}  # {seq_num: timestamp} - para calcular SampleRTT
+        self.unacked_segments = {}  # {seq_num: data} - segmentos aguardando ACK
         
         # Threads
         self.receive_thread = None
@@ -104,6 +105,21 @@ class SimpleTCPSocket:
         self.state_lock = threading.Lock()
         
         self.logger = setup_logger('SimpleTCPSocket')
+        self._send_interceptor = None
+    
+    def set_send_interceptor(self, interceptor):
+        """
+        Define função para interceptar envios UDP (usado em testes).
+        
+        interceptor(data, dest, send_func) deve decidir se envia ou descarta.
+        """
+        self._send_interceptor = interceptor
+    
+    def _udp_send(self, data, dest):
+        """Envia segmento via UDP aplicando interceptor se configurado."""
+        if self._send_interceptor:
+            return self._send_interceptor(data, dest, self.udp_socket.sendto)
+        return self.udp_socket.sendto(data, dest)
     
     def connect(self, dest_address):
         """
@@ -135,7 +151,7 @@ class SimpleTCPSocket:
             window_size=self.recv_window,
             data=b''
         )
-        self.udp_socket.sendto(segment, dest_address)
+        self._udp_send(segment, dest_address)
         self.logger.info(f"SYN enviado (seq={self.seq_num})")
         
         # Aguardar SYN-ACK (com timeout)
@@ -234,10 +250,11 @@ class SimpleTCPSocket:
                 segment_data = data[:segment_size]
                 
                 # Criar segmento
+                current_seq = self.seq_num
                 segment = TCPSegment.create_segment(
                     src_port=self.port,
                     dst_port=self.peer_port,
-                    seq_num=self.seq_num,
+                    seq_num=current_seq,
                     ack_num=self.ack_num,
                     flags=TCPSegment.FLAG_ACK,
                     window_size=self.recv_window,
@@ -245,14 +262,17 @@ class SimpleTCPSocket:
                 )
                 
                 # Enviar
-                self.udp_socket.sendto(segment, (self.peer_address, self.peer_port))
-                self.logger.debug(f"Segmento enviado: seq={self.seq_num}, len={len(segment_data)}")
+                self._udp_send(segment, (self.peer_address, self.peer_port))
+                self.logger.debug(f"Segmento enviado: seq={current_seq}, len={len(segment_data)}")
+                
+                # Guardar cópia para possível retransmissão
+                self.unacked_segments[current_seq] = segment_data
                 
                 # Armazenar timestamp para cálculo de RTT
-                self.send_times[self.seq_num] = time.time()
+                self.send_times[current_seq] = time.time()
                 
                 # Iniciar timer
-                self._start_timer(self.seq_num)
+                self._start_timer(current_seq)
                 
                 # Atualizar sequência
                 self.seq_num += len(segment_data)
@@ -279,9 +299,21 @@ class SimpleTCPSocket:
         while True:
             with self.recv_buffer_lock:
                 if self.recv_buffer:
-                    data = self.recv_buffer.popleft()
+                    chunks = []
+                    total = 0
+                    while self.recv_buffer and total < buffer_size:
+                        chunk = self.recv_buffer.popleft()
+                        needed = buffer_size - total
+                        if len(chunk) <= needed:
+                            chunks.append(chunk)
+                            total += len(chunk)
+                        else:
+                            chunks.append(chunk[:needed])
+                            total += needed
+                            self.recv_buffer.appendleft(chunk[needed:])
+                    data = b''.join(chunks)
                     self.bytes_received += len(data)
-                    return data[:buffer_size]
+                    return data
             
             if time.time() - timeout_start > 5:
                 return b''
@@ -351,7 +383,7 @@ class SimpleTCPSocket:
                 window_size=self.recv_window,
                 data=b''
             )
-            self.udp_socket.sendto(syn_ack, (self.peer_address, self.peer_port))
+            self._udp_send(syn_ack, (self.peer_address, self.peer_port))
             
             with self.state_lock:
                 self.state = self.SYN_RCVD
@@ -371,7 +403,7 @@ class SimpleTCPSocket:
                 window_size=self.recv_window,
                 data=b''
             )
-            self.udp_socket.sendto(ack, (self.peer_address, self.peer_port))
+            self._udp_send(ack, (self.peer_address, self.peer_port))
             
             with self.state_lock:
                 self.state = self.ESTABLISHED
@@ -379,6 +411,16 @@ class SimpleTCPSocket:
     
     def _handle_ack(self, ack_num):
         """Trata ACK recebido."""
+        if self.state == self.SYN_RCVD:
+            expected_ack = self.seq_num + 1
+            if ack_num >= expected_ack:
+                with self.state_lock:
+                    self.state = self.ESTABLISHED
+                self.seq_num = ack_num
+                self.send_base = ack_num
+                self.logger.info("ACK final recebido pelo servidor, conexão estabelecida")
+                return
+        
         if ack_num > self.send_base:
             # Calcular SampleRTT para o último segmento confirmado
             # O ACK confirma todos os bytes até ack_num-1
@@ -412,6 +454,12 @@ class SimpleTCPSocket:
             
             self.logger.debug(f"ACK recebido: ack={ack_num}, base atualizado {old_base} -> {self.send_base}")
             
+            # Remover segmentos confirmados do buffer de não confirmados
+            with self.send_buffer_lock:
+                confirmed = [seq for seq, data in self.unacked_segments.items() if seq + len(data) <= ack_num]
+                for seq in confirmed:
+                    self.unacked_segments.pop(seq, None)
+            
             # Tentar enviar mais dados
             self._send_data()
     
@@ -433,7 +481,7 @@ class SimpleTCPSocket:
                 window_size=self.recv_window,
                 data=b''
             )
-            self.udp_socket.sendto(ack, (self.peer_address, self.peer_port))
+            self._udp_send(ack, (self.peer_address, self.peer_port))
             self.logger.debug(f"Dados recebidos: {len(data)} bytes, ACK enviado (ack={self.ack_num})")
         else:
             # Dados fora de ordem (simplificado: descarta)
@@ -448,7 +496,7 @@ class SimpleTCPSocket:
                 window_size=self.recv_window,
                 data=b''
             )
-            self.udp_socket.sendto(ack, (self.peer_address, self.peer_port))
+            self._udp_send(ack, (self.peer_address, self.peer_port))
     
     def _handle_fin(self, segment, addr):
         """Trata segmento FIN."""
@@ -487,7 +535,7 @@ class SimpleTCPSocket:
                 window_size=self.recv_window,
                 data=b''
             )
-            self.udp_socket.sendto(fin, (self.peer_address, self.peer_port))
+            self._udp_send(fin, (self.peer_address, self.peer_port))
             
             with self.state_lock:
                 self.state = self.FIN_WAIT_1
@@ -519,7 +567,7 @@ class SimpleTCPSocket:
                 window_size=self.recv_window,
                 data=b''
             )
-            self.udp_socket.sendto(fin, (self.peer_address, self.peer_port))
+            self._udp_send(fin, (self.peer_address, self.peer_port))
             
             with self.state_lock:
                 self.state = self.LAST_ACK
@@ -562,9 +610,27 @@ class SimpleTCPSocket:
             # (em implementação mais sofisticada, poderia usar Karn's algorithm)
             pass
         
-        # Retransmitir (simplificado: retransmitir desde seq_num)
-        # Em implementação real, seria necessário manter buffer de segmentos enviados
-        self._send_data()
+        # Retransmitir todos os segmentos não confirmados a partir de seq_num (Go-Back-N)
+        with self.send_buffer_lock:
+            pending = [(seq, data) for seq, data in self.unacked_segments.items() if seq >= seq_num]
+        
+        if not pending:
+            return
+        
+        for seq, data in sorted(pending):
+            segment = TCPSegment.create_segment(
+                src_port=self.port,
+                dst_port=self.peer_port,
+                seq_num=seq,
+                ack_num=self.ack_num,
+                flags=TCPSegment.FLAG_ACK,
+                window_size=self.recv_window,
+                data=data
+            )
+            self._udp_send(segment, (self.peer_address, self.peer_port))
+            self.logger.debug(f"Segmento retransmitido: seq={seq}, len={len(data)}")
+            self.send_times[seq] = time.time()
+            self._start_timer(seq)
     
     def _calculate_timeout(self):
         """Calcula timeout baseado em RTT."""

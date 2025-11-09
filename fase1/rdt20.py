@@ -139,6 +139,26 @@ class RDT20Sender:
         _, _, is_valid = RDT20Packet.parse_packet(packet)
         return not is_valid
     
+    @staticmethod
+    def _format_data(data: bytes, limit: int = 30) -> str:
+        """Formata os dados para exibição em logs."""
+        preview = data[:limit]
+        try:
+            text = preview.decode('utf-8', errors='replace')
+        except Exception:
+            text = repr(preview)
+        suffix = '...' if len(data) > limit else ''
+        return f"'{text}'{suffix}"
+    
+    def _format_packet_payload(self, packet: bytes) -> str:
+        """Extrai e formata o payload de um pacote DATA."""
+        if not packet:
+            return "<vazio>"
+        pkt_type, payload, _ = RDT20Packet.parse_packet(packet)
+        if pkt_type != Packet.TYPE_DATA:
+            return "<controle>"
+        return self._format_data(payload)
+    
     def rdt_send(self, data):
         """
         Método rdt_send - Evento de entrada na camada de transporte.
@@ -167,7 +187,9 @@ class RDT20Sender:
         # Ação: udt_send(sndpkt)
         self.udt_send(self.sndpkt)
         
-        self.logger.info(f"[Estado: {self.state}] Pacote enviado: {len(data)} bytes")
+        self.logger.info(
+            f"\n[Estado: {self.state}] Pacote enviado: {len(data)} bytes | Dados: {self._format_data(data)}"
+        )
         
         # Transição: Estado 1 -> Estado 2
         self.state = self.WAIT_ACK_OR_NAK
@@ -192,7 +214,9 @@ class RDT20Sender:
                 
                 # Evento: rdt_rcv(rcvpkt) && isNAK(rcvpkt)
                 if self.isNAK(rcvpkt):
-                    self.logger.warning(f"[Estado: {self.state}] NAK recebido, retransmitindo...")
+                    self.logger.warning(
+                        f"\n[Estado: {self.state}] NAK recebido, retransmitindo dados: {self._format_packet_payload(self.sndpkt)}"
+                    )
                     self.retransmissions += 1
                     # Ação: udt_send(sndpkt)
                     self.udt_send(self.sndpkt)
@@ -201,7 +225,9 @@ class RDT20Sender:
                 
                 # Evento: rdt_rcv(rcvpkt) && corrupt(rcvpkt)
                 if self.corrupt(rcvpkt):
-                    self.logger.warning(f"[Estado: {self.state}] ACK/NAK corrompido recebido, retransmitindo...")
+                    self.logger.warning(
+                        f"\n[Estado: {self.state}] ACK/NAK corrompido recebido, retransmitindo dados: {self._format_packet_payload(self.sndpkt)}"
+                    )
                     self.retransmissions += 1
                     # Ação: udt_send(sndpkt)
                     self.udt_send(self.sndpkt)
@@ -219,7 +245,9 @@ class RDT20Sender:
                     return True
                 
             except socket.timeout:
-                self.logger.warning(f"[Estado: {self.state}] Timeout aguardando ACK/NAK, retransmitindo...")
+                self.logger.warning(
+                    f"\n[Estado: {self.state}] Timeout aguardando ACK/NAK, retransmitindo dados: {self._format_packet_payload(self.sndpkt)}"
+                )
                 self.retransmissions += 1
                 # Retransmitir em caso de timeout
                 self.udt_send(self.sndpkt)
@@ -325,7 +353,8 @@ class RDT20Receiver:
         """
         self.received_count += 1
         self.messages.append(data)
-        self.logger.info(f"Dados entregues para camada superior: {len(data)} bytes")
+        formatted = RDT20Sender._format_data(data)
+        self.logger.info(f"\nDados entregues para camada superior: {len(data)} bytes | Conteúdo: {formatted}")
     
     def corrupt(self, rcvpkt):
         """
@@ -394,10 +423,12 @@ class RDT20Receiver:
             if self.notcorrupt(rcvpkt):
                 packet_type, _, _ = RDT20Packet.parse_packet(rcvpkt)
                 if packet_type == Packet.TYPE_DATA:
-                    self.logger.info(f"[Estado: {self.state}] Pacote DATA recebido e válido")
-                    
                     # Ação: extract(rcvpkt, data)
                     data = self.extract(rcvpkt, None)
+                    formatted = RDT20Sender._format_data(data)
+                    self.logger.info(
+                        f"\n[Estado: {self.state}] Pacote DATA recebido e válido | Dados: {formatted}"
+                    )
                     
                     # Ação: deliver_data(data)
                     self.deliver_data(data)

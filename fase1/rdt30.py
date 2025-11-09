@@ -186,7 +186,7 @@ class RDT30Sender:
         while (self.state == self.WAIT_ACK_0) or (self.state == self.WAIT_ACK_1):
             try:
                 # Evento: rdt_rcv(rcvpkt)
-                rcvpkt, addr = self.socket.recvfrom(1024)
+                rcvpkt, addr = self.socket.recvfrom(8192)
                 packet_type, ack_seq, _, is_valid = RDT21Packet.parse_packet(rcvpkt)
                 
                 # Evento: rdt_rcv(rcvpkt) && (corrupt(rcvpkt) || isACK(rcvpkt, 1-seq))
@@ -341,7 +341,7 @@ class RDT30Receiver:
         
         try:
             # Evento: rdt_rcv(rcvpkt)
-            rcvpkt, addr = self.socket.recvfrom(1024)
+            rcvpkt, addr = self.socket.recvfrom(8192)
             packet_type, seq_num, _, is_valid = RDT21Packet.parse_packet(rcvpkt)
             
             if packet_type != Packet.TYPE_DATA:
