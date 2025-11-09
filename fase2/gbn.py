@@ -86,6 +86,7 @@ class GBNSender:
         self.start_time = None
         self.bytes_sent = 0
         self.running = True
+        self.window_full_logs = 0
         
         # Estado do FSM
         self.state = self.WAIT
@@ -169,7 +170,12 @@ class GBNSender:
         Args:
             data: dados a serem recusados
         """
-        self.logger.warning(f"[Estado: {self.state}] Janela cheia, recusando dados (janela={self.N})")
+        if self.window_full_logs < 3:
+            self.logger.warning(
+                f"[Estado: {self.state}] Janela cheia, recusando dados "
+                f"(janela={self.N}, base={self.base}, nextseqnum={self.nextseqnum})"
+            )
+            self.window_full_logs += 1
         # Em implementação real, poderia bufferizar ou retornar erro
     
     def rdt_send(self, data):
@@ -262,7 +268,7 @@ class GBNSender:
         while self.running:
             try:
                 # Evento: rdt_rcv(rcvpkt)
-                rcvpkt, addr = self.socket.recvfrom(1024)
+                rcvpkt, addr = self.socket.recvfrom(8192)
                 packet_type, _, _, is_valid = GBNPacket.parse_packet(rcvpkt)
                 
                 if packet_type != Packet.TYPE_ACK:
@@ -276,12 +282,29 @@ class GBNSender:
                 
                 # Evento: rdt_rcv(rcvpkt) && notcorrupt(rcvpkt)
                 if self.notcorrupt(rcvpkt):
-                    # Ação: base = getacknum(rcvpkt) + 1
                     ack_num = self.getacknum(rcvpkt)
+
+                    # Ignorar ACKs duplicados ou atrasados que apontam para pacotes já confirmados
+                    if ack_num < self.base - 1:
+                        self.logger.debug(
+                            f"[Estado: {self.state}] ACK duplicado/atrasado recebido (ACK {ack_num}), base atual {self.base}"
+                        )
+                        continue
+
+                    # Limitar ACK maior do que nextseqnum - 1 (defensivo)
+                    ack_num = min(ack_num, self.nextseqnum - 1)
+
                     old_base = self.base
                     self.base = ack_num + 1
                     
-                    self.logger.info(f"[Estado: {self.state}] ACK cumulativo recebido: ACK {ack_num}, base atualizado {old_base} -> {self.base}")
+                    if self.base != old_base:
+                        self.logger.info(
+                            f"[Estado: {self.state}] ACK cumulativo recebido: ACK {ack_num}, base atualizado {old_base} -> {self.base}"
+                        )
+                    else:
+                        self.logger.debug(
+                            f"[Estado: {self.state}] ACK repetido recebido: ACK {ack_num}, base permanece {self.base}"
+                        )
                     
                     # Remover pacotes confirmados
                     seqs_to_remove = [s for s in self.sndpkt.keys() if s < self.base]
@@ -484,7 +507,7 @@ class GBNReceiver:
         
         try:
             # Evento: rdt_rcv(rcvpkt)
-            rcvpkt, addr = self.socket.recvfrom(1024)
+            rcvpkt, addr = self.socket.recvfrom(8192)
             packet_type, seq_num, _, is_valid = GBNPacket.parse_packet(rcvpkt)
             
             if packet_type != Packet.TYPE_DATA:
@@ -523,7 +546,7 @@ class GBNReceiver:
                 return None
                 
         except socket.timeout:
-            self.logger.info(f"[Estado: {self.state}] Timeout na recepção")
+            # Mantemos silêncio nesse caso para não poluir os logs do teste.
             return None
         except Exception as e:
             self.logger.error(f"Erro ao receber: {e}")

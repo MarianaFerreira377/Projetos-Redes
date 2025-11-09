@@ -6,6 +6,8 @@ import random
 import threading
 import socket
 
+from utils.packet import GBNPacket, Packet
+
 
 class UnreliableChannel:
     """Simula um canal de rede não confiável."""
@@ -70,4 +72,54 @@ class DirectChannel:
     def send_direct(self, packet, dest_socket, dest_addr):
         """Alias para send."""
         dest_socket.sendto(packet, dest_addr)
+
+
+class GBNBoundedLossChannel(UnreliableChannel):
+    """
+    Canal com perdas controladas para testes do GBN.
+
+    - Apenas pacotes DATA podem ser descartados.
+    - Cada sequência pode ser perdida no máximo uma vez (na primeira tentativa).
+    - ACKs nunca são perdidos/corrompidos.
+    """
+
+    def __init__(self, loss_rate=0.1, corrupt_rate=0.0, delay_range=(0.01, 0.15)):
+        super().__init__(loss_rate=loss_rate, corrupt_rate=corrupt_rate, delay_range=delay_range)
+        # Estados possíveis por (tipo, seqnum):
+        # "new" (ainda não enviado), "lost_once" (primeira tentativa perdida), "delivered" (já entregue)
+        self._packet_state = {}
+
+    def send(self, packet, dest_socket, dest_addr):
+        packet_type = None
+        seqnum = None
+        key = None
+        
+        try:
+            packet_type, seqnum, _, _ = GBNPacket.parse_packet(packet)
+            key = (packet_type, seqnum)
+        except Exception:
+            # Se não for possível parsear (por exemplo, mensagem de controle),
+            # tratamos como canal genérico.
+            pass
+        
+        if key is not None and packet_type == Packet.TYPE_DATA:
+            state = self._packet_state.get(key, "new")
+            if state == "new":
+                if random.random() < self.loss_rate:
+                    self._packet_state[key] = "lost_once"
+                    print(f"[SIMULADOR] Pacote DATA seq={seqnum} perdido (tentativa inicial)")
+                    return
+                self._packet_state[key] = "delivered"
+            elif state == "lost_once":
+                # Primeira retransmissão deve passar sem novas perdas.
+                self._packet_state[key] = "delivered"
+            # Se já foi entregue, mantemos o envio direto (sem drops adicionais).
+        elif key is None and random.random() < self.loss_rate:
+            # Pacotes sem formatação GBN (mensagens de controle) respeitam a taxa.
+            print("[SIMULADOR] Pacote genérico perdido")
+            return
+        
+        # ACKs nunca são perdidos e o canal de perdas não aplica corrupção adicional.
+        delay = random.uniform(*self.delay_range)
+        threading.Timer(delay, lambda: dest_socket.sendto(packet, dest_addr)).start()
 
